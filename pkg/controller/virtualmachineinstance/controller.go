@@ -2,16 +2,21 @@ package virtualmachineinstance
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 
-	"github.com/harvester/harvester/pkg/builder"
-	"github.com/harvester/harvester/pkg/controller/master/virtualmachine"
-	ctlv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
+	cfg "github.com/harvester/harvester-cloud-provider/pkg/config"
+	ctlv1 "github.com/harvester/harvester-cloud-provider/pkg/generated/controllers/kubevirt.io/v1"
+	utils "github.com/harvester/harvester-cloud-provider/pkg/utils"
 	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	cloudnodeutil "k8s.io/cloud-provider/node/helpers"
 	kubevirtv1 "kubevirt.io/api/core/v1"
@@ -29,19 +34,21 @@ func Register(
 	ctx context.Context,
 	restClient kubernetes.Interface,
 	nodes ctlcorev1.NodeController,
+	configMaps ctlcorev1.ConfigMapController,
 	vmis ctlv1.VirtualMachineInstanceController,
 	kubevirtClient kubecli.KubevirtClient,
 	nodeToVMName *sync.Map,
 	namespace string,
 ) {
 	handler := &Handler{
-		vmis:           vmis,
-		vmiCache:       vmis.Cache(),
-		nodeCache:      nodes.Cache(),
-		restClient:     restClient,
-		kubevirtClient: kubevirtClient,
-		nodeToVMName:   nodeToVMName,
-		namespace:      namespace,
+		vmis:            vmis,
+		vmiCache:        vmis.Cache(),
+		nodeCache:       nodes.Cache(),
+		configMapClient: configMaps,
+		restClient:      restClient,
+		kubevirtClient:  kubevirtClient,
+		nodeToVMName:    nodeToVMName,
+		namespace:       namespace,
 	}
 	logrus.WithFields(logrus.Fields{
 		"controller": vmiControllerName,
@@ -51,11 +58,12 @@ func Register(
 }
 
 type Handler struct {
-	vmis           ctlv1.VirtualMachineInstanceController
-	vmiCache       ctlv1.VirtualMachineInstanceCache
-	nodeCache      ctlcorev1.NodeCache
-	restClient     kubernetes.Interface
-	kubevirtClient kubecli.KubevirtClient
+	vmis            ctlv1.VirtualMachineInstanceController
+	vmiCache        ctlv1.VirtualMachineInstanceCache
+	nodeCache       ctlcorev1.NodeCache
+	configMapClient ctlcorev1.ConfigMapClient
+	restClient      kubernetes.Interface
+	kubevirtClient  kubecli.KubevirtClient
 
 	nodeToVMName *sync.Map
 
@@ -65,9 +73,12 @@ type Handler struct {
 func (h *Handler) OnVmiChanged(_ string, vmi *kubevirtv1.VirtualMachineInstance) (*kubevirtv1.VirtualMachineInstance, error) {
 	// TODO: Add some unit tests for this controller
 
+	if vmi == nil || vmi.DeletionTimestamp != nil {
+		return vmi, nil
+	}
+
 	// only handle the migration completed vmi
-	if vmi == nil || vmi.DeletionTimestamp != nil ||
-		vmi.Annotations == nil || vmi.Namespace != h.namespace || !isMigrationCompleted(vmi) {
+	if vmi.Annotations == nil || vmi.Labels == nil || vmi.Namespace != h.namespace || !utils.IsMigrationCompleted(vmi) {
 		logrus.WithFields(logrus.Fields{
 			"namespace": vmi.Namespace,
 			"name":      vmi.Name,
@@ -75,7 +86,7 @@ func (h *Handler) OnVmiChanged(_ string, vmi *kubevirtv1.VirtualMachineInstance)
 		return vmi, nil
 	}
 
-	if creator := vmi.Labels[builder.LabelKeyVirtualMachineCreator]; creator != virtualmachine.VirtualMachineCreatorNodeDriver {
+	if creator := vmi.Labels[utils.HarvesterLabelKeyVirtualMachineCreator]; creator != utils.HarvesterVirtualMachineCreatorNodeDriver {
 		logrus.WithFields(logrus.Fields{
 			"namespace": vmi.Namespace,
 			"name":      vmi.Name,
@@ -115,6 +126,10 @@ func (h *Handler) OnVmiChanged(_ string, vmi *kubevirtv1.VirtualMachineInstance)
 		}
 	}
 
+	if err := h.syncNADMappingConfigMap(); err != nil {
+		return vmi, fmt.Errorf("failed to sync NAD mapping ConfigMap: %w", err)
+	}
+
 	return vmi, nil
 }
 
@@ -131,6 +146,58 @@ func compareTopology(a map[string]string, b map[string]string) bool {
 		a[corev1.LabelTopologyZone] == b[corev1.LabelTopologyZone]
 }
 
-func isMigrationCompleted(vmi *kubevirtv1.VirtualMachineInstance) bool {
-	return vmi.Status.MigrationState == nil || vmi.Status.MigrationState.Completed
+// syncNADMappingConfigMap computes the common NAD→interface mapping across all VMIs
+// in this guest cluster and stores it in a ConfigMap in kube-system.
+// If the mapping is empty, the value is cleared (set to "").
+func (h *Handler) syncNADMappingConfigMap() error {
+	clusterName := cfg.GetConfig().ClusterName
+
+	if clusterName == "" || clusterName == utils.DefaultGuestClusterName {
+		// Return an error and exit early to prevent cross-cluster pollution
+		return fmt.Errorf("failed to sync NAD mapping ConfigMap: guest cluster name configuration is empty/default, we cannot identify the cluster")
+	}
+
+	sel := labels.Set{utils.LabelKeyGuestClusterNameOnVM: clusterName}.AsSelector()
+	vmis, err := h.vmiCache.List(h.namespace, sel)
+	if err != nil {
+		return err
+	}
+
+	var value string
+	if mapping := utils.GetCommonVMINADs(vmis); len(mapping) > 0 {
+		data, err := json.Marshal(mapping)
+		if err != nil {
+			return fmt.Errorf("marshal NAD mapping: %w", err)
+		}
+		value = string(data)
+	}
+
+	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		existing, err := h.configMapClient.Get(metav1.NamespaceSystem, utils.ConfigMapNADMapping, metav1.GetOptions{})
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				return err
+			}
+			_, err = h.configMapClient.Create(&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      utils.ConfigMapNADMapping,
+					Namespace: metav1.NamespaceSystem,
+				},
+				Data: map[string]string{
+					utils.ConfigMapKeyNADMapping: value,
+				},
+			})
+			return err
+		}
+		if existing.Data[utils.ConfigMapKeyNADMapping] == value {
+			return nil
+		}
+		cmCopy := existing.DeepCopy()
+		if cmCopy.Data == nil {
+			cmCopy.Data = make(map[string]string)
+		}
+		cmCopy.Data[utils.ConfigMapKeyNADMapping] = value
+		_, err = h.configMapClient.Update(cmCopy)
+		return err
+	})
 }

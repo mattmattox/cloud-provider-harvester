@@ -2,12 +2,15 @@ package ccm
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"sync"
 
+	"github.com/sirupsen/logrus"
+
+	ctlkubevirt "github.com/harvester/harvester-cloud-provider/pkg/generated/controllers/kubevirt.io"
 	ctllb "github.com/harvester/harvester-load-balancer/pkg/generated/controllers/loadbalancer.harvesterhci.io"
-	ctlkubevirt "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io"
 	ctlcore "github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
 	"github.com/rancher/wrangler/v3/pkg/kubeconfig"
 	"github.com/rancher/wrangler/v3/pkg/signals"
@@ -18,6 +21,7 @@ import (
 	"k8s.io/klog/v2"
 	"kubevirt.io/client-go/kubecli"
 
+	cfg "github.com/harvester/harvester-cloud-provider/pkg/config"
 	vmi "github.com/harvester/harvester-cloud-provider/pkg/controller/virtualmachineinstance"
 )
 
@@ -26,8 +30,6 @@ const (
 
 	threadiness = 2
 )
-
-var DisableVMIController bool
 
 type CloudProvider struct {
 	localCoreFactory *ctlcore.Factory
@@ -51,6 +53,10 @@ func init() {
 }
 
 func newCloudProvider(reader io.Reader) (cloudprovider.Interface, error) {
+	if reader == nil {
+		return nil, fmt.Errorf("can't init from an empty reader (io.Reader), check the --cloud-config to ensure it has a valid cloud-config")
+	}
+
 	bytes, err := io.ReadAll(reader)
 	if err != nil {
 		return nil, err
@@ -105,6 +111,7 @@ func newCloudProvider(reader io.Reader) (cloudprovider.Interface, error) {
 		lbClient:       cp.lbFactory.Loadbalancer().V1beta1().LoadBalancer(),
 		localSvcClient: cp.localCoreFactory.Core().V1().Service(),
 		localSvcCache:  cp.localCoreFactory.Core().V1().Service().Cache(),
+		configMapCache: cp.localCoreFactory.Core().V1().ConfigMap().Cache(),
 		namespace:      namespace,
 	}
 	cp.instances = &instanceManager{
@@ -114,17 +121,20 @@ func newCloudProvider(reader io.Reader) (cloudprovider.Interface, error) {
 		namespace:    namespace,
 	}
 
+	logrus.Infof("New CloudProvider Harvester on namespace %s", namespace)
+
 	return cp, nil
 }
 
 func (c *CloudProvider) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
 	client := clientBuilder.ClientOrDie(ProviderName)
 
-	if !DisableVMIController {
+	if !cfg.GetConfig().DisableVMIController {
 		vmi.Register(
 			c.Context,
 			client,
 			c.localCoreFactory.Core().V1().Node(),
+			c.localCoreFactory.Core().V1().ConfigMap(),
 			c.kubevirtFactory.Kubevirt().V1().VirtualMachineInstance(),
 			c.kubevirtClient,
 			c.nodeToVMName,
@@ -133,7 +143,7 @@ func (c *CloudProvider) Initialize(clientBuilder cloudprovider.ControllerClientB
 	}
 
 	go func() {
-		if err := start.All(c.Context, threadiness, c.kubevirtFactory, c.localCoreFactory); err != nil {
+		if err := start.All(c.Context, threadiness, c.kubevirtFactory, c.localCoreFactory, c.lbFactory); err != nil {
 			klog.Fatalf("error starting controllers: %s", err.Error())
 		}
 		<-stop
